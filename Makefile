@@ -3,6 +3,6 @@ clean:
 
 nnfc: src/main.cpp
 	mkdir -p build
-	g++ -o build/main src/main.cpp
+	g++ -ggdb -Wall -Wextra -o build/main src/main.cpp
 
 all: nnfc

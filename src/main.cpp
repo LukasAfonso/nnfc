@@ -3,6 +3,7 @@
 #include <iostream>
 #include <sstream>
 #include <cstdio>
+#include <cstring>
 
 #define MAT_AT(mat, i, j) (mat).values[assert(i < (mat).rows && j < (mat).cols && i >= 0 && j >= 0), (i) * (mat).cols + (j)]
 #define MAT_FREE(mat) if ((mat).values) { free((mat).values); (mat).values = nullptr; }
@@ -22,7 +23,8 @@ typedef struct
 typedef struct
 {
     size_t count;
-    Mat *items;
+    Mat *layers;
+    Mat *activations;
 } Traces;
 
 inline Mat allocate_mat(int rows, int cols)
@@ -30,6 +32,13 @@ inline Mat allocate_mat(int rows, int cols)
     Mat mat = {rows, cols, nullptr};
     mat.values = static_cast<double*>(malloc(sizeof(*mat.values) * rows * cols));
     return mat;
+}
+
+inline Mat mat_dup(const Mat& mat)
+{
+    Mat res = allocate_mat(mat.rows, mat.cols);
+    memcpy(res.values, mat.values, mat.cols * mat.rows * sizeof(double));
+    return res;
 }
 
 inline void fill_mat(const Mat &mat, double value)
@@ -179,16 +188,63 @@ inline Mat transpose(const Mat& mat)
     return transposed;
 }
 
+Mat relu(const Mat& mat)
+{
+    Mat result = allocate_mat(mat.rows, mat.cols);
+    for (int i = 0; i < mat.rows; ++i)
+    {
+        for (int j = 0; j < mat.cols; ++j)
+        {
+            if (MAT_AT(mat, i, j) < 0)
+            {
+                MAT_AT(result, i, j) = 0;
+            }
+            else
+            {
+                MAT_AT(result, i, j) = MAT_AT(mat, i, j);
+            }
+        }
+    }
+
+    return result;
+}
+
+Mat relu_der(const Mat& mat)
+{
+    Mat result = allocate_mat(mat.rows, mat.cols);
+    for (int i = 0; i < mat.rows; ++i)
+    {
+        for (int j = 0; j < mat.cols; ++j)
+        {
+            if (MAT_AT(mat, i, j) < 0)
+            {
+                MAT_AT(result, i, j) = 0;
+            } else
+            {
+                MAT_AT(result, i, j) = 1;
+            }
+        }
+    }
+
+    return result;
+}
+
 Mat forward_pass(const Weights& weights, const Traces& traces, const Mat& X)
 {
     assert(weights.count == traces.count);
-    traces.items[0] = X;
+    traces.layers[0] = X;
 
     Mat prev = dot(weights.items[0], X);
+    traces.activations[0] = mat_dup(prev);
+    prev = relu(prev);
     for (int l = 1; l < weights.count; ++l)
     {
         Mat new_step = dot(weights.items[l], prev);
-        traces.items[l] = prev;
+        traces.activations[l] = mat_dup(new_step);
+
+        new_step = relu(new_step);
+        traces.layers[l] = prev;
+
         prev = new_step;
     }
 
@@ -231,7 +287,9 @@ Weights backward_pass(const Weights& weights, const Traces& traces, const Mat& l
 
     for (int l = static_cast<int>(grads.count) - 1; l >= 0; --l)
     {
-        grads.items[l] = dot(upstream, transpose(traces.items[l]));
+        upstream = mult(upstream, relu_der(traces.activations[l]));
+        Mat grad = dot(upstream, transpose(traces.layers[l]));
+        grads.items[l] = grad;
         upstream = dot(transpose(weights.items[l]), upstream);
     }
 
@@ -310,15 +368,14 @@ int main()
     {
         Traces traces;
         traces.count = weights.count;
-        traces.items = static_cast<Mat*>(malloc(sizeof(Mat) * traces.count));
+        traces.layers = static_cast<Mat*>(malloc(sizeof(Mat) * traces.count));
+        traces.activations = static_cast<Mat*>(malloc(sizeof(Mat) * traces.count));
 
         Mat logits = forward_pass(weights, traces, X);
         double loss = mse_loss(logits, y);
         Mat loss_der = mse_der(logits, y);
 
         std::cout << "Loss:            " << loss << std::endl;
-        // std::cout << "Loss derivative: " << std::endl;
-
         Weights grads = backward_pass(weights, traces, loss_der);
         step_optimizer(weights, grads, lr);
 
@@ -326,8 +383,6 @@ int main()
 
         MAT_FREE(logits);
         MAT_FREE(loss_der);
-        // MAT_FREE(grads);
-        // TODO free traces
     }
 
     print_mat(weights.items[0]);

@@ -2,6 +2,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -114,6 +115,19 @@ typedef struct
     size_t count;
     Mat *items;
 } Weights;
+
+typedef struct
+{
+    size_t count;
+    Mat *weights;
+    Mat *biases;
+} Params;
+
+typedef struct
+{
+    Weights weights;
+    Weights biases;
+} Grads;
 
 typedef struct
 {
@@ -238,6 +252,23 @@ inline Mat add(const Mat& mat1, const Mat& mat2)
     return res;
 }
 
+inline Mat add_bias(const Mat& mat, const Mat& bias)
+{
+    assert(mat.rows == bias.rows);
+    assert(bias.cols == 1);
+    const Mat res = allocate_temp_mat(mat.rows, mat.cols);
+
+    for (int i = 0; i < mat.rows; ++i)
+    {
+        for (int j = 0; j < mat.cols; ++j)
+        {
+            MAT_AT(res, i, j) = MAT_AT(mat, i, j) + MAT_AT(bias, i, 0);
+        }
+    }
+
+    return res;
+}
+
 inline Mat mult(const Mat& mat1, const Mat& mat2)
 {
     assert(mat1.rows == mat2.rows);
@@ -266,6 +297,22 @@ inline double sum(const Mat& mat)
         }
     }
     return sum;
+}
+
+inline Mat sum_cols(const Mat& mat)
+{
+    Mat res = allocate_temp_mat(mat.rows, 1);
+    for (int i = 0; i < mat.rows; ++i)
+    {
+        double row_sum = 0;
+        for (int j = 0; j < mat.cols; ++j)
+        {
+            row_sum += MAT_AT(mat, i, j);
+        }
+        MAT_AT(res, i, 0) = row_sum;
+    }
+
+    return res;
 }
 
 inline Mat add_scalar(const Mat& mat1, double scalar)
@@ -312,62 +359,51 @@ inline Mat transpose(const Mat& mat)
     return transposed;
 }
 
-Mat relu(const Mat& mat)
+Mat sigmoid(const Mat& mat)
 {
     Mat result = allocate_temp_mat(mat.rows, mat.cols);
     for (int i = 0; i < mat.rows; ++i)
     {
         for (int j = 0; j < mat.cols; ++j)
         {
-            if (MAT_AT(mat, i, j) < 0)
-            {
-                MAT_AT(result, i, j) = 0;
-            }
-            else
-            {
-                MAT_AT(result, i, j) = MAT_AT(mat, i, j);
-            }
+            MAT_AT(result, i, j) = 1.0 / (1.0 + exp(-MAT_AT(mat, i, j)));
         }
     }
 
     return result;
 }
 
-Mat relu_der(const Mat& mat)
+Mat sigmoid_der(const Mat& mat)
 {
     Mat result = allocate_temp_mat(mat.rows, mat.cols);
     for (int i = 0; i < mat.rows; ++i)
     {
         for (int j = 0; j < mat.cols; ++j)
         {
-            if (MAT_AT(mat, i, j) < 0)
-            {
-                MAT_AT(result, i, j) = 0;
-            } else
-            {
-                MAT_AT(result, i, j) = 1;
-            }
+            double s = 1.0 / (1.0 + exp(-MAT_AT(mat, i, j)));
+            MAT_AT(result, i, j) = s * (1.0 - s);
         }
     }
 
     return result;
 }
 
-Mat forward_pass(const Weights& weights, const Traces& traces, const Mat& X)
+Mat forward_pass(const Params& params, const Traces& traces, const Mat& X)
 {
-    assert(weights.count == traces.count);
+    assert(params.count == traces.count);
     traces.layers[0] = X;
 
-    Mat prev = dot(weights.items[0], X);
+    Mat prev = add_bias(dot(params.weights[0], X), params.biases[0]);
     traces.activations[0] = mat_temp_dup(prev);
-    prev = relu(prev);
-    for (int l = 1; l < weights.count; ++l)
-    {
-        Mat new_step = dot(weights.items[l], prev);
-        traces.activations[l] = mat_temp_dup(new_step);
+    prev = sigmoid(prev);
 
-        new_step = relu(new_step);
+    for (int l = 1; l < static_cast<int>(params.count); ++l)
+    {
+        Mat new_step = add_bias(dot(params.weights[l], prev), params.biases[l]);
+        traces.activations[l] = mat_temp_dup(new_step);
         traces.layers[l] = prev;
+
+        new_step = sigmoid(new_step);
 
         prev = new_step;
     }
@@ -375,20 +411,23 @@ Mat forward_pass(const Weights& weights, const Traces& traces, const Mat& X)
     return prev;
 }
 
-double mse_loss(const Mat& logits, const Mat& y)
+double bce_loss(const Mat& logits, const Mat& y)
 {
     assert(logits.cols == y.cols);
     assert(logits.rows == y.rows && logits.rows == 1);
-    double mse = 0;
+    double bce = 0;
     for (int i = 0; i < logits.cols; ++i)
     {
-        mse += (MAT_AT(logits, 0, i) - MAT_AT(y, 0, i)) * (MAT_AT(logits, 0, i) - MAT_AT(y, 0, i));
+        double pred = MAT_AT(logits, 0, i);
+        pred = std::fmax(1e-7, std::fmin(1.0 - 1e-7, pred));
+        double target = MAT_AT(y, 0, i);
+        bce += -(target * log(pred) + (1.0 - target) * log(1.0 - pred));
     }
 
-    return mse / logits.cols;
+    return bce / logits.cols;
 }
 
-Mat mse_der(const Mat& logits, const Mat& y)
+Mat bce_der(const Mat& logits, const Mat& y)
 {
     assert(logits.cols == y.cols);
     assert(logits.rows == y.rows && logits.rows == 1);
@@ -396,43 +435,59 @@ Mat mse_der(const Mat& logits, const Mat& y)
 
     for (int i = 0; i < logits.cols; ++i)
     {
-        MAT_AT(ders, 0, i) = 2 * (MAT_AT(logits, 0, i) - MAT_AT(y, 0, i)) / logits.cols;
+        MAT_AT(ders, 0, i) = (MAT_AT(logits, 0, i) - MAT_AT(y, 0, i)) / logits.cols;
     }
     return ders;
 }
 
-Weights backward_pass(const Weights& weights, const Traces& traces, const Mat& loss_der)
+Grads backward_pass(const Params& params, const Traces& traces, const Mat& loss_der)
 {
-    Weights grads;
-    grads.count = weights.count;
-    grads.items = (Mat*)malloc(sizeof(Mat) * grads.count);
+    Grads grads;
+    grads.weights.count = params.count;
+    grads.weights.items = (Mat*)malloc(sizeof(Mat) * grads.weights.count);
+    grads.biases.count = params.count;
+    grads.biases.items = (Mat*)malloc(sizeof(Mat) * grads.biases.count);
 
     Mat upstream = loss_der;
 
-    for (int l = static_cast<int>(grads.count) - 1; l >= 0; --l)
+    for (int l = static_cast<int>(params.count) - 1; l >= 0; --l)
     {
-        upstream = mult(upstream, relu_der(traces.activations[l]));
+        if (l + 1 < static_cast<int>(params.count))
+        {
+            upstream = mult(upstream, sigmoid_der(traces.activations[l]));
+        }
         Mat grad = dot(upstream, transpose(traces.layers[l]));
-        grads.items[l] = grad;
-        upstream = dot(transpose(weights.items[l]), upstream);
+        grads.weights.items[l] = grad;
+        grads.biases.items[l] = sum_cols(upstream);
+        upstream = dot(transpose(params.weights[l]), upstream);
     }
 
     return grads;
 }
 
-void step_optimizer(Weights weights, const Weights& grads, const double& lr)
+void step_optimizer(const Params& params, const Grads& grads, const double& lr)
 {
-    for (int layer = 0; layer < weights.count; ++layer)
+    for (int layer = 0; layer < static_cast<int>(params.count); ++layer)
     {
-        Mat scaled_grads = mult_scalar(grads.items[layer], -lr);
-        Mat new_wei = add(weights.items[layer], scaled_grads);
-        weights.items[layer] = new_wei;
+        for (int i = 0; i < params.weights[layer].rows; ++i)
+        {
+            for (int j = 0; j < params.weights[layer].cols; ++j)
+            {
+                MAT_AT(params.weights[layer], i, j) -= lr * MAT_AT(grads.weights.items[layer], i, j);
+            }
+        }
+
+        for (int i = 0; i < params.biases[layer].rows; ++i)
+        {
+            MAT_AT(params.biases[layer], i, 0) -= lr * MAT_AT(grads.biases.items[layer], i, 0);
+        }
     }
 }
 
 int main()
 {
     gc_init(1024 * 1024);
+    srand(0);
 
     // Dataset (simple y = 2*x1 + x2 function)
     // Mat X = allocate_mat(2, 10 * 10);
@@ -468,46 +523,64 @@ int main()
     std::cout << "y:" << std::endl;
     print_mat(y);
 
-    double lr = 0.001;
-    int net[] = {2, 2, 1};
+    double lr = 0.01;
+    int net[] = {2, 3, 1};
 
-    Weights weights;
-    weights.items = (Mat*)malloc(sizeof(Mat) * std::size(net));
-    weights.count = std::size(net) - 1;
+    Params params;
+    params.count = std::size(net) - 1;
+    params.weights = static_cast<Mat*>(malloc(sizeof(Mat) * params.count));
+    params.biases = static_cast<Mat*>(malloc(sizeof(Mat) * params.count));
 
-    for (int i = 0; i < std::size(net) - 1; ++i)
+    for (int i = 0; i < static_cast<int>(params.count); ++i)
     {
-        weights.items[i] = allocate_mat(net[i+1], net[i]);
-        fill_random_mat(weights.items[i], 0.1);
+        params.weights[i] = allocate_mat(net[i + 1], net[i]);
+        fill_random_mat(params.weights[i], 1.0);
+        params.biases[i] = allocate_mat(net[i + 1], 1);
+        fill_random_mat(params.biases[i], 1.0);
     }
 
-    for (int step = 0; step < 50; ++step)
+    for (int step = 0; step < 100000; ++step)
     {
         Traces traces;
-        traces.count = weights.count;
+        traces.count = params.count;
         traces.layers = static_cast<Mat*>(malloc(sizeof(Mat) * traces.count));
         traces.activations = static_cast<Mat*>(malloc(sizeof(Mat) * traces.count));
 
-        Mat logits = forward_pass(weights, traces, X);
-        double loss = mse_loss(logits, y);
-        Mat loss_der = mse_der(logits, y);
+        Mat logits = forward_pass(params, traces, X);
+        double loss = bce_loss(logits, y);
+        Mat loss_der = bce_der(logits, y);
 
-        std::cout << "Loss:            " << loss << std::endl;
-        Weights grads = backward_pass(weights, traces, loss_der);
-        step_optimizer(weights, grads, lr);
+        if (step % 5000 == 0 || step == 99999)
+        {
+            std::cout << "Step " << step << " Loss: " << loss << std::endl;
+        }
+        Grads grads = backward_pass(params, traces, loss_der);
+        step_optimizer(params, grads, lr);
 
-        std::cout << "===================================" << std::endl;
+        free(grads.weights.items);
+        free(grads.biases.items);
+        free(traces.layers);
+        free(traces.activations);
         gc_cleanup();
     }
 
+    Traces final_traces;
+    final_traces.count = params.count;
+    final_traces.layers = static_cast<Mat*>(malloc(sizeof(Mat) * params.count));
+    final_traces.activations = static_cast<Mat*>(malloc(sizeof(Mat) * params.count));
+    Mat logits = forward_pass(params, final_traces, X);
+    std::cout << "Predictions:" << std::endl;
+    print_mat(logits);
+    free(final_traces.layers);
+    free(final_traces.activations);
 
-    print_mat(weights.items[0]);
-
-    for (size_t w = 0; w < weights.count; ++w)
+    for (size_t w = 0; w < params.count; ++w)
     {
-        GC_DELETE(weights.items[w].values);
+        GC_DELETE(params.weights[w].values);
+        GC_DELETE(params.biases[w].values);
     }
-    free(weights.items);
+    free(params.weights);
+    free(params.biases);
 
     GC_DELETE(X.values);
     GC_DELETE(y.values);

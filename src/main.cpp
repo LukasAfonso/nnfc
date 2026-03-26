@@ -116,25 +116,51 @@ typedef struct
     Mat *items;
 } Weights;
 
+enum LayerKind
+{
+    LYR_LINEAR,
+    LYR_SIGMOID,
+    LYR_RELU,
+};
+
+typedef struct
+{
+    int in_features;
+    int out_features;
+    LayerKind kind;
+} LayerSpec;
+
+typedef struct
+{
+    size_t count;
+    LayerSpec *specs;
+    Mat *weights;
+    Mat *biases;
+} Model;
+
 typedef struct
 {
     size_t count;
     Mat *weights;
     Mat *biases;
-} Params;
-
-typedef struct
-{
-    Weights weights;
-    Weights biases;
 } Grads;
 
 typedef struct
 {
     size_t count;
-    Mat *layers;
-    Mat *activations;
+    Mat *inputs;
+    Mat *outputs;
 } Traces;
+
+inline Mat null_mat()
+{
+    Mat mat = {
+        .rows=0,
+        .cols=0,
+        .values=0,
+    };
+    return mat;
+}
 
 inline Mat allocate_mat(int rows, int cols)
 {
@@ -373,14 +399,14 @@ Mat sigmoid(const Mat& mat)
     return result;
 }
 
-Mat sigmoid_der(const Mat& mat)
+Mat sigmoid_der_from_output(const Mat& output)
 {
-    Mat result = allocate_temp_mat(mat.rows, mat.cols);
-    for (int i = 0; i < mat.rows; ++i)
+    Mat result = allocate_temp_mat(output.rows, output.cols);
+    for (int i = 0; i < output.rows; ++i)
     {
-        for (int j = 0; j < mat.cols; ++j)
+        for (int j = 0; j < output.cols; ++j)
         {
-            double s = 1.0 / (1.0 + exp(-MAT_AT(mat, i, j)));
+            double s = MAT_AT(output, i, j);
             MAT_AT(result, i, j) = s * (1.0 - s);
         }
     }
@@ -388,24 +414,115 @@ Mat sigmoid_der(const Mat& mat)
     return result;
 }
 
-Mat forward_pass(const Params& params, const Traces& traces, const Mat& X)
+Mat relu(const Mat& mat)
 {
-    assert(params.count == traces.count);
-    traces.layers[0] = X;
-
-    Mat prev = add_bias(dot(params.weights[0], X), params.biases[0]);
-    traces.activations[0] = mat_temp_dup(prev);
-    prev = sigmoid(prev);
-
-    for (int l = 1; l < static_cast<int>(params.count); ++l)
+    Mat result = allocate_temp_mat(mat.rows, mat.cols);
+    for (int i = 0; i < mat.rows; ++i)
     {
-        Mat new_step = add_bias(dot(params.weights[l], prev), params.biases[l]);
-        traces.activations[l] = mat_temp_dup(new_step);
-        traces.layers[l] = prev;
+        for (int j = 0; j < mat.cols; ++j)
+        {
+            MAT_AT(result, i, j) = std::max(0.0, MAT_AT(mat, i, j));
+        }
+    }
 
-        new_step = sigmoid(new_step);
+    return result;
+}
 
-        prev = new_step;
+Mat relu_der_from_output(const Mat& output)
+{
+    Mat result = allocate_temp_mat(output.rows, output.cols);
+    for (int i = 0; i < output.rows; ++i)
+    {
+        for (int j = 0; j < output.cols; ++j)
+        {
+            MAT_AT(result, i, j) = MAT_AT(output, i, j) > 0.0 ? 1.0 : 0.0;
+        }
+    }
+
+    return result;
+}
+
+Model create_model(const LayerSpec* specs, size_t count)
+{
+    Model model;
+    model.count = count;
+    model.specs = static_cast<LayerSpec*>(malloc(sizeof(LayerSpec) * count));
+    model.weights = static_cast<Mat*>(malloc(sizeof(Mat) * count));
+    model.biases = static_cast<Mat*>(malloc(sizeof(Mat) * count));
+
+    memcpy(model.specs, specs, sizeof(LayerSpec) * count);
+
+    int current_features = specs[0].in_features;
+    for (size_t l = 0; l < count; ++l)
+    {
+        assert(model.specs[l].in_features == current_features);
+
+        model.weights[l] = null_mat();
+        model.biases[l] = null_mat();
+
+        switch (model.specs[l].kind)
+        {
+            case LYR_LINEAR:
+                model.weights[l] = allocate_mat(model.specs[l].out_features, current_features);
+                fill_random_mat(model.weights[l], 1.0);
+                model.biases[l] = allocate_mat(model.specs[l].out_features, 1);
+                fill_random_mat(model.biases[l], 1.0);
+                break;
+            case LYR_RELU:
+            case LYR_SIGMOID:
+                assert(model.specs[l].out_features == current_features);
+                break;
+            default:
+                abort();
+        }
+
+        current_features = model.specs[l].out_features;
+    }
+
+    return model;
+}
+
+void free_model(const Model& model)
+{
+    for (size_t l = 0; l < model.count; ++l)
+    {
+        if (model.specs[l].kind == LYR_LINEAR)
+        {
+            GC_DELETE(model.weights[l].values);
+            GC_DELETE(model.biases[l].values);
+        }
+    }
+
+    free(model.specs);
+    free(model.weights);
+    free(model.biases);
+}
+
+Mat forward_pass(const Model& model, const Traces& traces, const Mat& X)
+{
+    assert(model.count == traces.count);
+
+    Mat prev = X;
+    for (size_t l = 0; l < model.count; ++l)
+    {
+        traces.inputs[l] = prev;
+
+        switch (model.specs[l].kind)
+        {
+            case LYR_LINEAR:
+                prev = add_bias(dot(model.weights[l], prev), model.biases[l]);
+                break;
+            case LYR_SIGMOID:
+                prev = sigmoid(prev);
+                break;
+            case LYR_RELU:
+                prev = relu(prev);
+                break;
+            default:
+                abort();
+        }
+
+        traces.outputs[l] = mat_temp_dup(prev);
     }
 
     return prev;
@@ -427,6 +544,24 @@ double bce_loss(const Mat& logits, const Mat& y)
     return bce / logits.cols;
 }
 
+double mse_loss(const Mat& logits, const Mat& y)
+{
+    assert(logits.cols == y.cols);
+    assert(logits.rows == y.rows);
+
+    double mse = 0;
+    for (int i = 0; i < logits.rows; ++i)
+    {
+        for (int j = 0; j < logits.cols; ++j)
+        {
+            double diff = MAT_AT(logits, i, j) - MAT_AT(y, i, j);
+            mse += diff * diff;
+        }
+    }
+
+    return mse / (logits.rows * logits.cols);
+}
+
 Mat bce_der(const Mat& logits, const Mat& y)
 {
     assert(logits.cols == y.cols);
@@ -435,51 +570,91 @@ Mat bce_der(const Mat& logits, const Mat& y)
 
     for (int i = 0; i < logits.cols; ++i)
     {
-        MAT_AT(ders, 0, i) = (MAT_AT(logits, 0, i) - MAT_AT(y, 0, i)) / logits.cols;
+        double pred = MAT_AT(logits, 0, i);
+        pred = std::fmax(1e-7, std::fmin(1.0 - 1e-7, pred));
+        double target = MAT_AT(y, 0, i);
+        MAT_AT(ders, 0, i) = (pred - target) / (pred * (1.0 - pred) * logits.cols);
     }
     return ders;
 }
 
-Grads backward_pass(const Params& params, const Traces& traces, const Mat& loss_der)
+Mat mse_der(const Mat& logits, const Mat& y)
+{
+    assert(logits.cols == y.cols);
+    assert(logits.rows == y.rows);
+
+    Mat ders = allocate_temp_mat(y.rows, y.cols);
+    double scale = 2.0 / (logits.rows * logits.cols);
+
+    for (int i = 0; i < logits.rows; ++i)
+    {
+        for (int j = 0; j < logits.cols; ++j)
+        {
+            MAT_AT(ders, i, j) = scale * (MAT_AT(logits, i, j) - MAT_AT(y, i, j));
+        }
+    }
+
+    return ders;
+}
+
+Grads backward_pass(const Model& model, const Traces& traces, const Mat& loss_der)
 {
     Grads grads;
-    grads.weights.count = params.count;
-    grads.weights.items = (Mat*)malloc(sizeof(Mat) * grads.weights.count);
-    grads.biases.count = params.count;
-    grads.biases.items = (Mat*)malloc(sizeof(Mat) * grads.biases.count);
+    grads.count = model.count;
+    grads.weights = static_cast<Mat*>(malloc(sizeof(Mat) * grads.count));
+    grads.biases = static_cast<Mat*>(malloc(sizeof(Mat) * grads.count));
+
+    for (size_t l = 0; l < grads.count; ++l)
+    {
+        grads.weights[l] = null_mat();
+        grads.biases[l] = null_mat();
+    }
 
     Mat upstream = loss_der;
 
-    for (int l = static_cast<int>(params.count) - 1; l >= 0; --l)
+    for (int l = static_cast<int>(model.count) - 1; l >= 0; --l)
     {
-        if (l + 1 < static_cast<int>(params.count))
+        switch (model.specs[l].kind)
         {
-            upstream = mult(upstream, sigmoid_der(traces.activations[l]));
+            case LYR_SIGMOID:
+                upstream = mult(upstream, sigmoid_der_from_output(traces.outputs[l]));
+                break;
+            case LYR_RELU:
+                upstream = mult(upstream, relu_der_from_output(traces.outputs[l]));
+                break;
+            case LYR_LINEAR:
+                grads.weights[l] = dot(upstream, transpose(traces.inputs[l]));
+                grads.biases[l] = sum_cols(upstream);
+                upstream = dot(transpose(model.weights[l]), upstream);
+                break;
+            default:
+                abort();
         }
-        Mat grad = dot(upstream, transpose(traces.layers[l]));
-        grads.weights.items[l] = grad;
-        grads.biases.items[l] = sum_cols(upstream);
-        upstream = dot(transpose(params.weights[l]), upstream);
     }
 
     return grads;
 }
 
-void step_optimizer(const Params& params, const Grads& grads, const double& lr)
+void step_optimizer(const Model& model, const Grads& grads, const double& lr)
 {
-    for (int layer = 0; layer < static_cast<int>(params.count); ++layer)
+    for (int layer = 0; layer < static_cast<int>(model.count); ++layer)
     {
-        for (int i = 0; i < params.weights[layer].rows; ++i)
+        if (model.specs[layer].kind != LYR_LINEAR)
         {
-            for (int j = 0; j < params.weights[layer].cols; ++j)
+            continue;
+        }
+
+        for (int i = 0; i < model.weights[layer].rows; ++i)
+        {
+            for (int j = 0; j < model.weights[layer].cols; ++j)
             {
-                MAT_AT(params.weights[layer], i, j) -= lr * MAT_AT(grads.weights.items[layer], i, j);
+                MAT_AT(model.weights[layer], i, j) -= lr * MAT_AT(grads.weights[layer], i, j);
             }
         }
 
-        for (int i = 0; i < params.biases[layer].rows; ++i)
+        for (int i = 0; i < model.biases[layer].rows; ++i)
         {
-            MAT_AT(params.biases[layer], i, 0) -= lr * MAT_AT(grads.biases.items[layer], i, 0);
+            MAT_AT(model.biases[layer], i, 0) -= lr * MAT_AT(grads.biases[layer], i, 0);
         }
     }
 }
@@ -490,33 +665,33 @@ int main()
     srand(0);
 
     // Dataset (simple y = 2*x1 + x2 function)
-    // Mat X = allocate_mat(2, 10 * 10);
-    // Mat y = allocate_mat(1, 10 * 10);
-    // int ix = 0;
-    // for (int x1 = 1; x1 <= 10; x1++)
-    // {
-    //     for (int x2 = 1; x2 <= 10; x2++)
-    //     {
-    //         MAT_AT(X, 0, ix) = x1;
-    //         MAT_AT(X, 1, ix) = x2;
-    //         MAT_AT(y, 0, ix) = 1.7 * x1 + x2;
-    //         ix++;
-    //     }
-    // }
-
-    // XOR dataset
-    Mat X = allocate_mat(2, 4);
-    Mat y = allocate_mat(1, 4);
-    for (int i = 0; i < 2; ++i)
+    Mat X = allocate_mat(2, 10 * 10);
+    Mat y = allocate_mat(1, 10 * 10);
+    int ix = 0;
+    for (int x1 = 1; x1 <= 10; x1++)
     {
-        for (int j = 0; j < 2; ++j)
+        for (int x2 = 1; x2 <= 10; x2++)
         {
-            int ix = 2 * i + j;
-            MAT_AT(X, 0, ix) = i;
-            MAT_AT(X, 1, ix) = j;
-            MAT_AT(y, 0, ix) = i ^ j;
+            MAT_AT(X, 0, ix) = x1;
+            MAT_AT(X, 1, ix) = x2;
+            MAT_AT(y, 0, ix) = 1.7 * x1 + x2;
+            ix++;
         }
     }
+
+    // XOR dataset
+    // Mat X = allocate_mat(2, 4);
+    // Mat y = allocate_mat(1, 4);
+    // for (int i = 0; i < 2; ++i)
+    // {
+    //     for (int j = 0; j < 2; ++j)
+    //     {
+    //         int ix = 2 * i + j;
+    //         MAT_AT(X, 0, ix) = i;
+    //         MAT_AT(X, 1, ix) = j;
+    //         MAT_AT(y, 0, ix) = i ^ j;
+    //     }
+    // }
 
     std::cout << "X:" << std::endl;
     print_mat(X);
@@ -524,63 +699,52 @@ int main()
     print_mat(y);
 
     double lr = 0.01;
-    int net[] = {2, 3, 1};
+    LayerSpec specs[] = {
+        {2, 3, LYR_LINEAR},
+        {3, 3, LYR_SIGMOID},
+        {3, 3, LYR_LINEAR},
+        {3, 3, LYR_SIGMOID},
+        {3, 1, LYR_LINEAR},
+    };
 
-    Params params;
-    params.count = std::size(net) - 1;
-    params.weights = static_cast<Mat*>(malloc(sizeof(Mat) * params.count));
-    params.biases = static_cast<Mat*>(malloc(sizeof(Mat) * params.count));
-
-    for (int i = 0; i < static_cast<int>(params.count); ++i)
-    {
-        params.weights[i] = allocate_mat(net[i + 1], net[i]);
-        fill_random_mat(params.weights[i], 1.0);
-        params.biases[i] = allocate_mat(net[i + 1], 1);
-        fill_random_mat(params.biases[i], 1.0);
-    }
+    Model model = create_model(specs, std::size(specs));
 
     for (int step = 0; step < 100000; ++step)
     {
         Traces traces;
-        traces.count = params.count;
-        traces.layers = static_cast<Mat*>(malloc(sizeof(Mat) * traces.count));
-        traces.activations = static_cast<Mat*>(malloc(sizeof(Mat) * traces.count));
+        traces.count = model.count;
+        traces.inputs = static_cast<Mat*>(malloc(sizeof(Mat) * traces.count));
+        traces.outputs = static_cast<Mat*>(malloc(sizeof(Mat) * traces.count));
 
-        Mat logits = forward_pass(params, traces, X);
-        double loss = bce_loss(logits, y);
-        Mat loss_der = bce_der(logits, y);
+        Mat logits = forward_pass(model, traces, X);
+        double loss = mse_loss(logits, y);
+        Mat loss_der = mse_der(logits, y);
 
         if (step % 5000 == 0 || step == 99999)
         {
             std::cout << "Step " << step << " Loss: " << loss << std::endl;
         }
-        Grads grads = backward_pass(params, traces, loss_der);
-        step_optimizer(params, grads, lr);
+        Grads grads = backward_pass(model, traces, loss_der);
+        step_optimizer(model, grads, lr);
 
-        free(grads.weights.items);
-        free(grads.biases.items);
-        free(traces.layers);
-        free(traces.activations);
+        free(grads.weights);
+        free(grads.biases);
+        free(traces.inputs);
+        free(traces.outputs);
         gc_cleanup();
     }
 
     Traces final_traces;
-    final_traces.count = params.count;
-    final_traces.layers = static_cast<Mat*>(malloc(sizeof(Mat) * params.count));
-    final_traces.activations = static_cast<Mat*>(malloc(sizeof(Mat) * params.count));
-    Mat logits = forward_pass(params, final_traces, X);
+    final_traces.count = model.count;
+    final_traces.inputs = static_cast<Mat*>(malloc(sizeof(Mat) * model.count));
+    final_traces.outputs = static_cast<Mat*>(malloc(sizeof(Mat) * model.count));
+    Mat logits = forward_pass(model, final_traces, X);
     std::cout << "Predictions:" << std::endl;
     print_mat(logits);
-    free(final_traces.layers);
-    free(final_traces.activations);
+    free(final_traces.inputs);
+    free(final_traces.outputs);
 
-    for (size_t w = 0; w < params.count; ++w)
-    {
-        GC_DELETE(params.weights[w].values);
-        GC_DELETE(params.biases[w].values);
-    }
-    free(params.weights);
-    free(params.biases);
+    free_model(model);
 
     GC_DELETE(X.values);
     GC_DELETE(y.values);
